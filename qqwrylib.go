@@ -1,12 +1,14 @@
-package main
+package qqwry
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
-	"io/ioutil"
+	"errors"
 	"log"
 	"net"
-	"os"
+	"sync"
+	"time"
 
 	"github.com/yinheli/mahonia"
 )
@@ -21,86 +23,153 @@ type QQwry struct {
 	buff  []byte
 	start uint32
 	end   uint32
+	sync.RWMutex
 }
+
 type Rq struct {
-	Ip      string `json:"Ip"`
-	Country string `json:"City"`
-	City    string `json:"Detail"`
-	Err     int    `json:"Err"`
-	Msg     string `json:"ErrorMsg"`
+	Ip   string
+	City string
+	Area string
 }
 
+var GlobalQQwry *QQwry
+var Once = &sync.Once{}
 
-func NewQQwry(file string) (qqwry *QQwry) {
+func Find(ip string) (result *Rq, err error) {
+	Once.Do(func() {
+		if GlobalQQwry, err = NewQQwry(); err != nil {
+			log.Printf("init default qqwry error, err=%s", err.Error())
+		} else {
+			log.Printf("init default qqwry success")
+		}
+	})
+	result, err = GlobalQQwry.Find(ip)
+	return
+}
+
+func NewQQwry() (qqwry *QQwry, err error) {
 	qqwry = &QQwry{}
-	f, e := os.Open(file)
-	if e != nil {
-		log.Println(e)
-		return nil
+	if err = qqwry.setBuff(); err != nil {
+		log.Printf("set buff error, err=%s\n", err.Error())
+		return
 	}
-	defer f.Close()
-	qqwry.buff, e = ioutil.ReadAll(f)
-	if e != nil {
-		log.Println(e)
-		return nil
-	}
-	qqwry.start = binary.LittleEndian.Uint32(qqwry.buff[:4])
-	qqwry.end = binary.LittleEndian.Uint32(qqwry.buff[4:8])
-	return qqwry
+	qqwry.update()
+	return
 }
+
+func (this *QQwry) update() {
+	go func() {
+		for true {
+			// 一小时探测一次, 太频繁会被屏蔽掉
+			time.Sleep(1 * time.Hour)
+			this.setBuff()
+		}
+	}()
+}
+
+func (this *QQwry) setBuff() (err error) {
+	defer func() {
+		if err != nil {
+			log.Printf("set buff error, err=%s\n", err.Error())
+		} else {
+			log.Printf("set buff success")
+		}
+	}()
+	var buff []byte
+	if buff, err = GetOnlineQQwryDat(); err != nil {
+		return
+	}
+	if bytes.Compare(buff, this.buff) == 0 {
+		log.Printf("don't update")
+		return
+	}
+	if len(buff) < 9 {
+		err = errors.New("invalid buff")
+		return
+	}
+	start := binary.LittleEndian.Uint32(buff[:4])
+	end := binary.LittleEndian.Uint32(buff[4:8])
+	this.Lock()
+	defer this.Unlock()
+	this.buff = buff
+	this.start = start
+	this.end = end
+	return
+}
+
+// func NewQQwry(file string) (qqwry *QQwry) {
+// 	qqwry = &QQwry{}
+// 	f, e := os.Open(file)
+// 	if e != nil {
+// 		log.Println(e)
+// 		return nil
+// 	}
+// 	defer f.Close()
+// 	qqwry.buff, e = ioutil.ReadAll(f)
+// 	if e != nil {
+// 		log.Println(e)
+// 		return nil
+// 	}
+// 	qqwry.start = binary.LittleEndian.Uint32(qqwry.buff[:4])
+// 	qqwry.end = binary.LittleEndian.Uint32(qqwry.buff[4:8])
+// 	return qqwry
+// }
+
 func (this *Rq) String() string {
 
 	d, _ := json.Marshal(this)
 	return string(d)
 }
-func (this *QQwry) Find(ip string) *Rq {
-	rq := &Rq{Ip: ip}
-	if this.buff == nil {
-		rq.Err = 3
-		rq.Msg = "QQwry没有初始化"
-		return rq
-	}
+func (this *QQwry) Find(ip string) (result *Rq, err error) {
+	result = &Rq{Ip: ip}
+	defer func() {
+		if err := recover(); err != nil {
+			result.City = "未知"
+			result.Area = "未知"
+		}
+	}()
 
-	var country []byte
+	var city []byte
 	var area []byte
 	ip_1 := net.ParseIP(ip)
 	if ip_1 == nil {
-		rq.Err = 1
-		rq.Msg = "错误的IP格式"
-		return rq
+		err = errors.New("invalid ip")
+		return
 	}
+
+	this.RLock()
+	defer this.RUnlock()
 	offset := this.searchRecord(binary.BigEndian.Uint32(ip_1.To4()))
 	if offset <= 0 {
-		rq.Err = 2
-		rq.Msg = "IP地址没找到归属地"
-		return rq
+		err = errors.New("not found")
+		return
 	}
 	mode := this.readMode(offset + 4)
 	if mode == REDIRECT_MODE_1 {
-		countryOffset := this.readUint32FromByte3(offset + 5)
+		cityOffset := this.readUint32FromByte3(offset + 5)
 
-		mode = this.readMode(countryOffset)
+		mode = this.readMode(cityOffset)
 		if mode == REDIRECT_MODE_2 {
-			c := this.readUint32FromByte3(countryOffset + 1)
-			country = this.readString(c)
-			countryOffset += 4
-			area = this.readArea(countryOffset)
+			c := this.readUint32FromByte3(cityOffset + 1)
+			city = this.readString(c)
+			cityOffset += 4
+			area = this.readArea(cityOffset)
 
 		} else {
-			country = this.readString(countryOffset)
-			countryOffset += uint32(len(country) + 1)
-			area = this.readArea(countryOffset)
+			city = this.readString(cityOffset)
+			cityOffset += uint32(len(city) + 1)
+			area = this.readArea(cityOffset)
 		}
 
 	} else if mode == REDIRECT_MODE_2 {
-		countryOffset := this.readUint32FromByte3(offset + 5)
-		country = this.readString(countryOffset)
+		cityOffset := this.readUint32FromByte3(offset + 5)
+		city = this.readString(cityOffset)
 		area = this.readArea(offset + 8)
 	}
 	enc := mahonia.NewDecoder("gbk")
-	rq.Country = enc.ConvertString(string(country))
-	rq.City = enc.ConvertString(string(area))
-	return rq
+	result.City = enc.ConvertString(string(city))
+	result.Area = enc.ConvertString(string(area))
+	return
 }
 
 func (this *QQwry) readUint32FromByte3(offset uint32) uint32 {
