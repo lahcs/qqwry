@@ -14,6 +14,14 @@ import (
 )
 
 const (
+	//1小时更新一次 太频繁会被屏蔽掉
+	QQWRY_ONLINE_UPDATE_INTERVAL time.Duration = 1 * time.Hour
+
+	OnlineUpdate  = true
+	OfflineUpdate = false
+)
+
+const (
 	INDEX_LEN       = 7
 	REDIRECT_MODE_1 = 0x01
 	REDIRECT_MODE_2 = 0x02
@@ -38,9 +46,9 @@ var Once = &sync.Once{}
 func Find(ip string) (result *Rq, err error) {
 	Once.Do(func() {
 		if GlobalQQwry, err = NewQQwry(); err != nil {
-			log.Printf("init default qqwry error, err=%s", err.Error())
+			log.Printf("[QQWry]Init Default QQWry Error: %s", err.Error())
 		} else {
-			log.Printf("init default qqwry success")
+			log.Printf("[QQWry]Init Default QQWry Success")
 		}
 	})
 	result, err = GlobalQQwry.Find(ip)
@@ -49,10 +57,13 @@ func Find(ip string) (result *Rq, err error) {
 
 func NewQQwry() (qqwry *QQwry, err error) {
 	qqwry = &QQwry{}
-	if err = qqwry.setBuff(); err != nil {
-		log.Printf("set buff error, err=%s\n", err.Error())
+	if err = qqwry.setBuff(OfflineUpdate); err != nil {
+		log.Printf("[QQWry]Set Database Error: %s\n", err.Error())
 		return
 	}
+
+	go qqwry.setBuff(OnlineUpdate)
+
 	qqwry.update()
 	return
 }
@@ -60,31 +71,60 @@ func NewQQwry() (qqwry *QQwry, err error) {
 func (this *QQwry) update() {
 	go func() {
 		for true {
-			// 一小时探测一次, 太频繁会被屏蔽掉
-			time.Sleep(1 * time.Hour)
-			this.setBuff()
+			time.Sleep(QQWRY_ONLINE_UPDATE_INTERVAL)
+			this.setBuff(OnlineUpdate)
 		}
 	}()
 }
 
-func (this *QQwry) setBuff() (err error) {
+func (this *QQwry) loadOnline() (b []byte, err error) {
+	if b, err = GetOnlineQQwryDat(); err != nil {
+		if b, err = GetLocalQQwryDat(); err != nil {
+			return
+		}
+	}
+
+	log.Printf("[QQWry]Load Online Database Success\n")
+	return
+}
+
+func (this *QQwry) loadLocal() (b []byte, err error) {
+	if b, err = GetLocalQQwryDat(); err != nil {
+		if b, err = GetOnlineQQwryDat(); err != nil {
+			return
+		}
+	}
+
+	log.Printf("[QQWry]Load Local Database Success\n")
+	return
+}
+
+func (this *QQwry) setBuff(NeedOnline bool) (err error) {
 	defer func() {
 		if err != nil {
-			log.Printf("set buff error, err=%s\n", err.Error())
-		} else {
-			log.Printf("set buff success")
+			log.Printf("[QQWry]Set Database Error: %s\n", err.Error())
 		}
 	}()
+
 	var buff []byte
-	if buff, err = GetOnlineQQwryDat(); err != nil {
-		return
+	//在线更新 用于程序运行后，定时更新
+	if NeedOnline {
+		if buff, err = this.loadOnline(); err != nil {
+			log.Printf("[QQWry]Load Database Error: %s\n", err.Error())
+			return
+		}
+	} else {
+		if buff, err = this.loadLocal(); err != nil {
+			log.Printf("[QQWry]Load Database Error: %s\n", err.Error())
+			return
+		}
 	}
+
 	if bytes.Compare(buff, this.buff) == 0 {
-		log.Printf("don't update")
 		return
 	}
 	if len(buff) < 9 {
-		err = errors.New("invalid buff")
+		err = errors.New("Invalid Database")
 		return
 	}
 	start := binary.LittleEndian.Uint32(buff[:4])
@@ -133,7 +173,7 @@ func (this *QQwry) Find(ip string) (result *Rq, err error) {
 	var area []byte
 	ip_1 := net.ParseIP(ip)
 	if ip_1 == nil {
-		err = errors.New("invalid ip")
+		err = errors.New("Invalid IP")
 		return
 	}
 
@@ -141,7 +181,7 @@ func (this *QQwry) Find(ip string) (result *Rq, err error) {
 	defer this.RUnlock()
 	offset := this.searchRecord(binary.BigEndian.Uint32(ip_1.To4()))
 	if offset <= 0 {
-		err = errors.New("not found")
+		err = errors.New("Not Found")
 		return
 	}
 	mode := this.readMode(offset + 4)
